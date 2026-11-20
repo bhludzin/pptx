@@ -22,6 +22,7 @@
   import AnimationPane from './AnimationPane.svelte'
   import { fitCanvasScale } from './lib/canvasScale.js'
   import { resetThumbnailCache, thumbnailDeckRenderKey } from './lib/thumbnailCache.js'
+  import { visibleRange } from './lib/virtualList.js'
   import type {
     AccessibilityReportDto,
     ChartDataDto,
@@ -158,6 +159,10 @@
   /** The editor canvas-area element, used to map clicks to slide coordinates. */
   let canvasAreaEl = $state<HTMLElement | null>(null)
   let canvasViewport = $state({ width: 0, height: 0 })
+  let slideListEl = $state<HTMLElement | null>(null)
+  let slideListScrollTop = $state(0)
+  let slideListViewportHeight = $state(0)
+  let slideListWidth = $state(0)
 
   /** Maximum grid dimension offered by the table size picker. */
   const PICKER_MAX = 6
@@ -306,6 +311,98 @@
       groups[groups.length - 1].indices.push(i)
     }
     return groups.filter((group) => group.indices.length > 0)
+  })
+
+  type SidebarRow =
+    | { kind: 'section'; section: SlideSectionDto; top: number; height: number; key: string }
+    | { kind: 'slide'; index: number; top: number; height: number; key: string }
+
+  const SIDEBAR_SECTION_HEIGHT = 34
+  const sidebarSlideHeight = $derived(
+    Math.max(
+      100,
+      Math.min(
+        190,
+        Math.ceil(
+          slideListWidth
+            * ((deck?.slideSize?.heightEmu ?? 6_858_000)
+              / (deck?.slideSize?.widthEmu ?? 12_192_000))
+            + 28,
+        ),
+      ),
+    ),
+  )
+  const sidebarRows = $derived.by<SidebarRow[]>(() => {
+    const rows: SidebarRow[] = []
+    let top = 0
+    for (const group of sectionGroups) {
+      if (group.section) {
+        rows.push({
+          kind: 'section',
+          section: group.section,
+          top,
+          height: SIDEBAR_SECTION_HEIGHT,
+          key: `section:${group.section.startSlideId}`,
+        })
+        top += SIDEBAR_SECTION_HEIGHT
+      }
+      if (!group.section || !collapsedSections.has(group.section.startSlideId)) {
+        for (const index of group.indices) {
+          const slide = deck?.slides[index]
+          if (!slide) continue
+          rows.push({
+            kind: 'slide',
+            index,
+            top,
+            height: sidebarSlideHeight,
+            key: `slide:${slide.id}`,
+          })
+          top += sidebarSlideHeight
+        }
+      }
+    }
+    return rows
+  })
+  const sidebarTotalHeight = $derived(
+    sidebarRows.length > 0
+      ? sidebarRows[sidebarRows.length - 1].top + sidebarRows[sidebarRows.length - 1].height
+      : 0,
+  )
+  const visibleSidebarRows = $derived.by(() => {
+    const range = visibleRange(
+      sidebarRows,
+      slideListScrollTop,
+      slideListViewportHeight,
+    )
+    return sidebarRows.slice(range.start, range.end)
+  })
+  const activeSidebarRow = $derived(
+    sidebarRows.find((row) => row.kind === 'slide' && row.index === activeIndex),
+  )
+
+  $effect(() => {
+    const element = slideListEl
+    if (!element) return
+    const update = () => {
+      slideListViewportHeight = element.clientHeight
+      slideListWidth = element.clientWidth
+    }
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(element)
+    return () => observer.disconnect()
+  })
+
+  $effect(() => {
+    const element = slideListEl
+    const row = activeSidebarRow
+    if (!element || !row) return
+    const bottom = row.top + row.height
+    if (row.top < element.scrollTop) {
+      element.scrollTop = row.top
+    } else if (bottom > element.scrollTop + element.clientHeight) {
+      element.scrollTop = Math.max(0, bottom - element.clientHeight)
+    }
   })
 
   $effect(() => {
@@ -1707,7 +1804,7 @@
   async function addSection(): Promise<void> {
     if (!deck) return
     const name = newSectionName.trim()
-    const startSlideId = newSectionSlideId || deck.slides[0]?.id
+    const startSlideId = newSectionSlideId || activeSlide?.id || deck.slides[0]?.id
     if (!name || !startSlideId) return
     const sections = [...deck.sections, { name, startSlideId }]
     deck = await invoke<DeckSnapshot>('set_sections', { sections })
@@ -2194,43 +2291,55 @@
             <button class="delete-slide" type="button" onclick={deleteActiveSlide} disabled={deck.slides.length <= 1 || documentBusy}
               aria-label="Delete selected slide" title={deck.slides.length <= 1 ? 'Keep at least one slide' : 'Delete selected slide (can be undone)'}>Delete</button>
           </div>
-          {#each sectionGroups as group (group.section?.startSlideId ?? '__nostart__')}
-            {#if group.section}
-              <div class="section-header">
-                <button
-                  type="button"
-                  class="section-toggle"
-                  onclick={() => toggleSectionCollapse(group.section!.startSlideId)}
-                  aria-expanded={!collapsedSections.has(group.section!.startSlideId)}
-                  title={collapsedSections.has(group.section!.startSlideId) ? 'Expand' : 'Collapse'}
+          <div
+            class="slide-list"
+            bind:this={slideListEl}
+            onscroll={(event) => (slideListScrollTop = event.currentTarget.scrollTop)}
+          >
+            <div class="slide-list-spacer" style:height={`${sidebarTotalHeight}px`}>
+              {#each visibleSidebarRows as row (row.key)}
+                <div
+                  class="slide-list-row"
+                  class:section-row={row.kind === 'section'}
+                  style:transform={`translateY(${row.top}px)`}
+                  style:height={`${row.height}px`}
                 >
-                  {collapsedSections.has(group.section!.startSlideId) ? '▶' : '▼'}
-                </button>
-                <span class="section-name" title={group.section.name}>{group.section.name}</span>
-                <button
-                  type="button"
-                  class="section-remove"
-                  onclick={() => removeSection(group.section!.startSlideId)}
-                  title="Remove section"
-                >
-                  ✕
-                </button>
-              </div>
-            {/if}
-            {#if !group.section || !collapsedSections.has(group.section.startSlideId)}
-              {#each group.indices as index (deck.slides[index].id)}
-                {@const slide = deck.slides[index]}
-                <span class="slide-number" aria-hidden="true">{index + 1}</span>
-                <SlideThumbnail
-                  {slide}
-                  deckRenderKey={thumbnailDeckKey}
-                  aspectRatio={thumbnailAspectRatio}
-                  selected={index === activeIndex}
-                  onClick={() => selectSlide(index)}
-                />
+                  {#if row.kind === 'section'}
+                    <div class="section-header">
+                      <button
+                        type="button"
+                        class="section-toggle"
+                        onclick={() => toggleSectionCollapse(row.section.startSlideId)}
+                        aria-expanded={!collapsedSections.has(row.section.startSlideId)}
+                        title={collapsedSections.has(row.section.startSlideId) ? 'Expand' : 'Collapse'}
+                      >
+                        {collapsedSections.has(row.section.startSlideId) ? '▶' : '▼'}
+                      </button>
+                      <span class="section-name" title={row.section.name}>{row.section.name}</span>
+                      <button
+                        type="button"
+                        class="section-remove"
+                        onclick={() => removeSection(row.section.startSlideId)}
+                        title="Remove section"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  {:else}
+                    {@const slide = deck.slides[row.index]}
+                    <span class="slide-number" aria-hidden="true">{row.index + 1}</span>
+                    <SlideThumbnail
+                      {slide}
+                      deckRenderKey={thumbnailDeckKey}
+                      aspectRatio={thumbnailAspectRatio}
+                      selected={row.index === activeIndex}
+                      onClick={() => selectSlide(row.index)}
+                    />
+                  {/if}
+                </div>
               {/each}
-            {/if}
-          {/each}
+            </div>
+          </div>
 
           <div class="section-add">
             <input
@@ -2240,16 +2349,24 @@
               bind:value={newSectionName}
               aria-label="New section name"
             />
-            <select
+            <input
               class="section-slide-select"
-              value={newSectionSlideId || activeSlide?.id || deck.slides[0]?.id || ''}
-              onchange={(event) => (newSectionSlideId = (event.target as HTMLSelectElement).value)}
+              type="number"
+              min="1"
+              max={deck.slides.length}
+              value={newSectionSlideId
+                ? Math.max(1, deck.slides.findIndex((slide) => slide.id === newSectionSlideId) + 1)
+                : activeIndex + 1}
+              onchange={(event) => {
+                const slides = deck?.slides ?? []
+                const index = Math.min(
+                  slides.length - 1,
+                  Math.max(0, Number((event.target as HTMLInputElement).value) - 1),
+                )
+                newSectionSlideId = slides[index]?.id ?? ''
+              }}
               aria-label="Section start slide"
-            >
-              {#each deck.slides as slide, index}
-                <option value={slide.id}>Slide {index + 1}</option>
-              {/each}
-            </select>
+            />
             <button type="button" onclick={addSection} disabled={!newSectionName.trim()}>
               Add Section
             </button>
@@ -2995,11 +3112,14 @@
   }
   .sidebar {
     width: 196px;
-    overflow-y: auto;
+    overflow: hidden;
     border-right: 1px solid #d7dce7;
     background: #f5f7fb;
     padding: 0.65rem;
     flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
   }
   .slide-navigation-heading { display: flex; align-items: center; justify-content: space-between; margin: .1rem .1rem .55rem; font-size: .76rem; color: #344966; }
   .slide-navigation-heading span { font-variant-numeric: tabular-nums; font-size: .68rem; color: #76859a; }
@@ -3009,6 +3129,21 @@
   .slide-actions button:disabled { opacity: .4; cursor: default; }
   .slide-actions .delete-slide { color: #974250; }
   .slide-number { display: block; margin: .25rem .1rem; color: #72829a; font-size: .64rem; font-variant-numeric: tabular-nums; }
+  .slide-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+  .slide-list-spacer {
+    position: relative;
+    width: 100%;
+  }
+  .slide-list-row {
+    position: absolute;
+    inset: 0 0 auto;
+    overflow: hidden;
+  }
   .add-slide-btn {
     display: block;
     width: 100%;

@@ -43,6 +43,13 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
     let mut out = Cursor::new(Vec::new());
     let mut writer = ZipWriter::new(&mut out);
     let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
+    let slide_by_id: HashMap<&str, &Slide> = session
+        .deck
+        .slides
+        .iter()
+        .map(|slide| (slide.id.as_str(), slide))
+        .collect();
+    let active_slide_ids: HashSet<&str> = slide_by_id.keys().copied().collect();
 
     let mut content_types = session.content_types.clone();
     content_types.ensure_override(&session.manifest_path, CT_MANIFEST);
@@ -54,16 +61,18 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
     // `slide<N>.xml` name so that package output is deterministic and never
     // overwrites an untouched part.
     let mut all_slide_paths = session.slide_paths.clone();
+    let mut used_slide_paths: HashSet<String> = all_slide_paths.values().cloned().collect();
     let mut new_slide_ids = Vec::new();
     let mut next_slide_index = next_slide_part_index(&mut archive)?;
     for slide in &session.deck.slides {
         if !all_slide_paths.contains_key(&slide.id) {
             let mut path = format!("ppt/slides/slide{next_slide_index}.xml");
-            while all_slide_paths.values().any(|existing| existing == &path) {
+            while used_slide_paths.contains(&path) {
                 next_slide_index += 1;
                 path = format!("ppt/slides/slide{next_slide_index}.xml");
             }
             next_slide_index += 1;
+            used_slide_paths.insert(path.clone());
             all_slide_paths.insert(slide.id.clone(), path);
             new_slide_ids.push(slide.id.clone());
         }
@@ -78,13 +87,22 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
     let mut dirty_slide_ids: HashSet<String> = session
         .dirty_slides
         .iter()
-        .filter(|id| session.deck.slide(id).is_some())
+        .filter(|id| active_slide_ids.contains(id.as_str()))
         .cloned()
         .collect();
     dirty_slide_ids.extend(new_slide_ids.iter().cloned());
     let dirty_paths: HashSet<String> = dirty_slide_ids
         .iter()
         .filter_map(|id| all_slide_paths.get(id).cloned())
+        .collect();
+    let dirty_slide_by_path: HashMap<&str, &Slide> = dirty_slide_ids
+        .iter()
+        .filter_map(|id| {
+            Some((
+                all_slide_paths.get(id)?.as_str(),
+                *slide_by_id.get(id.as_str())?,
+            ))
+        })
         .collect();
     let shape_save = prepare_shape_ids(session, &mut archive, &all_slide_paths, &dirty_slide_ids)?;
     let manifest_xml = write_manifest(session, &all_slide_paths, &shape_save.model_ids);
@@ -96,7 +114,7 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         || session
             .slide_paths
             .keys()
-            .any(|id| session.deck.slide(id).is_none());
+            .any(|id| !active_slide_ids.contains(id.as_str()));
     let mut presentation_save =
         match prepare_presentation_save(session, &mut archive, &all_slide_paths) {
             Ok(state) => state,
@@ -129,7 +147,7 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         let Some(slide_path) = all_slide_paths.get(slide_id) else {
             continue;
         };
-        let Some(slide) = session.deck.slides.iter().find(|s| &s.id == slide_id) else {
+        let Some(slide) = slide_by_id.get(slide_id.as_str()).copied() else {
             continue;
         };
 
@@ -303,9 +321,7 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         } else if let Some(bytes) = chart_save_state.patched_chart_parts.remove(&name) {
             writer.start_file(&name, options)?;
             writer.write_all(&bytes)?;
-        } else if let Some(slide) =
-            find_slide_by_path(session, &all_slide_paths, &dirty_paths, &name)
-        {
+        } else if let Some(slide) = dirty_slide_by_path.get(name.as_str()).copied() {
             let export_slide = shape_save.normalized_slide(slide);
             let slide = &export_slide;
             let mut original_xml = String::new();
@@ -333,9 +349,9 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
     // relationship files were collected by the same pre-passes as existing
     // slides, so images, charts, and hyperlinks are valid on first save.
     for slide_id in &new_slide_ids {
-        let slide = session
-            .deck
-            .slide(slide_id)
+        let slide = slide_by_id
+            .get(slide_id.as_str())
+            .copied()
             .expect("new slide remains in the deck while saving");
         let export_slide = shape_save.normalized_slide(slide);
         let slide = &export_slide;
@@ -709,21 +725,6 @@ fn max_rel_number(rels: &[Rel]) -> usize {
         .unwrap_or(0)
 }
 
-fn find_slide_by_path<'a>(
-    session: &'a Session,
-    slide_paths: &HashMap<String, String>,
-    dirty_paths: &HashSet<String>,
-    path: &str,
-) -> Option<&'a Slide> {
-    if !dirty_paths.contains(path) {
-        return None;
-    }
-    slide_paths
-        .iter()
-        .find(|(_, p)| *p == path)
-        .and_then(|(id, _)| session.deck.slides.iter().find(|s| s.id == *id))
-}
-
 /// The presentation package state that changes when the modeled slide
 /// structure differs from the package (insert, remove, or reorder).
 struct PresentationSaveState {
@@ -823,6 +824,7 @@ fn prepare_presentation_save(
         .max(256);
     let mut entries = Vec::with_capacity(session.deck.slides.len());
 
+    let mut next_relationship_number = max_rel_number(&rels).saturating_add(1);
     for slide in &session.deck.slides {
         let path = slide_paths
             .get(&slide.id)
@@ -838,7 +840,8 @@ fn prepare_presentation_save(
                 rid: rid.clone(),
             });
         } else {
-            let rid = next_rel_id(&rels);
+            let rid = format!("rId{next_relationship_number}");
+            next_relationship_number = next_relationship_number.saturating_add(1);
             rels.push(Rel {
                 id: rid.clone(),
                 rel_type: REL_TYPE_SLIDE.to_string(),
@@ -988,23 +991,29 @@ fn add_new_slide_layout_relationships(
     new_slide_ids: &[String],
     additions: &mut HashMap<String, Vec<Rel>>,
 ) -> Result<()> {
-    for new_id in new_slide_ids {
-        let new_index = session
-            .deck
-            .slides
-            .iter()
-            .position(|slide| &slide.id == new_id)
-            .ok_or_else(|| {
-                Error::Save(format!(
-                    "inserted slide '{new_id}' is missing from the deck"
-                ))
-            })?;
-        let source_id = session.deck.slides[..new_index]
-            .iter()
-            .rev()
-            .chain(session.deck.slides[new_index + 1..].iter())
-            .find(|slide| session.slide_paths.contains_key(&slide.id))
-            .map(|slide| slide.id.as_str())
+    let new_slide_ids: HashSet<&str> = new_slide_ids.iter().map(String::as_str).collect();
+    let mut next_loaded_id = vec![None; session.deck.slides.len()];
+    let mut next = None;
+    for (index, slide) in session.deck.slides.iter().enumerate().rev() {
+        next_loaded_id[index] = next;
+        if session.slide_paths.contains_key(&slide.id) {
+            next = Some(slide.id.as_str());
+        }
+    }
+
+    let mut previous_loaded_id = None;
+    let mut layout_targets: HashMap<&str, String> = HashMap::new();
+    for (new_index, slide) in session.deck.slides.iter().enumerate() {
+        if session.slide_paths.contains_key(&slide.id) {
+            previous_loaded_id = Some(slide.id.as_str());
+            continue;
+        }
+        if !new_slide_ids.contains(slide.id.as_str()) {
+            continue;
+        }
+        let new_id = slide.id.as_str();
+        let source_id = previous_loaded_id
+            .or(next_loaded_id[new_index])
             .ok_or_else(|| {
                 Error::Save(
                     "cannot add a slide because this package has no existing slide layout to copy"
@@ -1015,22 +1024,28 @@ fn add_new_slide_layout_relationships(
             .slide_paths
             .get(source_id)
             .expect("source id was selected from the path map");
-        let source_rels_path = rels_path_for(source_path);
-        let source_rels = parse_rels(&crate::load::read_entry_to_string(
-            archive,
-            &source_rels_path,
-        )?)?;
-        let layout = source_rels
-            .iter()
-            .find(|rel| rel.rel_type == REL_TYPE_SLIDE_LAYOUT)
-            .ok_or_else(|| {
-                Error::Save(format!(
-                    "cannot add a slide because source slide '{source_path}' has no slide layout relationship"
-                ))
+        let layout_target = if let Some(target) = layout_targets.get(source_id) {
+            target.clone()
+        } else {
+            let source_rels_path = rels_path_for(source_path);
+            let source_rels = parse_rels(&crate::load::read_entry_to_string(
+                archive,
+                &source_rels_path,
+            )?)?;
+            let layout = source_rels
+                .iter()
+                .find(|rel| rel.rel_type == REL_TYPE_SLIDE_LAYOUT)
+                .ok_or_else(|| {
+                    Error::Save(format!(
+                        "cannot add a slide because source slide '{source_path}' has no slide layout relationship"
+                    ))
+                })?;
+            let target = layout.resolve(&part_base_dir(source_path)).ok_or_else(|| {
+                Error::Save("source slide layout relationship is external".to_string())
             })?;
-        let layout_target = layout.resolve(&part_base_dir(source_path)).ok_or_else(|| {
-            Error::Save("source slide layout relationship is external".to_string())
-        })?;
+            layout_targets.insert(source_id, target.clone());
+            target
+        };
         let new_path = slide_paths
             .get(new_id)
             .expect("new slide path was allocated before saving");
@@ -1047,7 +1062,7 @@ fn add_new_slide_layout_relationships(
         additions.entry(new_rels_path).or_default().push(Rel {
             id: format!("rId{next}"),
             rel_type: REL_TYPE_SLIDE_LAYOUT.to_string(),
-            target: pkgmedia::relative_target(new_path, &layout_target),
+            target: pkgmedia::relative_target(new_path, layout_target.as_str()),
             target_mode: None,
         });
     }

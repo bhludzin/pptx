@@ -1871,6 +1871,15 @@ fn save_no_edit_keeps_byte_identical() {
 }
 
 #[test]
+fn generated_package_is_stable_after_reload() {
+    let session = load(&crate::create_blank_pptx()).expect("blank package should load");
+    let first = save(&session).expect("first save should succeed");
+    let reloaded = load(&first).expect("saved package should reload");
+    let second = save(&reloaded).expect("no-edit save should succeed");
+    assert_eq!(second, first);
+}
+
+#[test]
 fn save_edits_transition_preserves_other_parts() {
     let slide_xml = slide_with_transition_and_timing(
         Some(r#"<p:transition spd="500"><p:fade/></p:transition>"#),

@@ -313,6 +313,9 @@ pub fn load(bytes: &[u8]) -> Result<LoadResult> {
     let mut shape_package_ids: HashMap<String, HashMap<String, String>> = HashMap::new();
     if let Some(path) = &manifest_path {
         if let Ok(xml) = read_entry_to_string(&mut archive, path) {
+            if let Some(deck_id) = parse_manifest_deck_id(&xml) {
+                deck.id = deck_id;
+            }
             deck.comments = parse_manifest_collection(&xml, "comments");
             deck.sections = parse_manifest_collection(&xml, "sections");
             let mappings: Vec<crate::session::ShapeIdMapping> =
@@ -1945,6 +1948,22 @@ fn parse_manifest_collection<T: serde::de::DeserializeOwned>(xml: &str, element:
         buf.clear();
     }
     Vec::new()
+}
+
+/// Reads the stable deck identifier from the 900Slides manifest.
+fn parse_manifest_deck_id(xml: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf).ok()? {
+            Event::Start(start) | Event::Empty(start) if qname_str(start.name()) == "manifest" => {
+                return attr_by_local_name(&start, "deckId").filter(|id| !id.is_empty());
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
 }
 
 pub(crate) fn attr_by_local_name(e: &BytesStart<'_>, name: &str) -> Option<String> {
